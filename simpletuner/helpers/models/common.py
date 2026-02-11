@@ -2167,6 +2167,19 @@ class ModelFoundation(ABC):
                         self.accelerator.device,
                         dtype=self.config.weight_dtype,
                     )
+                # FSDP RAM-efficient loading leaves non-zero ranks with empty tensors
+                # for models not wrapped by FSDP (like text encoders). Broadcast from rank 0.
+                if (
+                    self.accelerator.state.distributed_type.name == "FSDP"
+                    and self.accelerator.num_processes > 1
+                ):
+                    import torch.distributed as dist
+                    if dist.is_initialized():
+                        for p in text_encoder.parameters():
+                            dist.broadcast(p.data, src=0)
+                        for b in text_encoder.buffers():
+                            dist.broadcast(b.data, src=0)
+
                 if hasattr(text_encoder, "eval"):
                     text_encoder.eval()
                 # Disable gradients immediately - text encoders are only used for inference

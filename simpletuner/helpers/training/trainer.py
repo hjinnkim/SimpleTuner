@@ -1695,7 +1695,6 @@ class Trainer:
                     self.init_freeze_models,
                     self.init_trainable_peft_adapter,
                     self.init_lyrics_embedder_training,
-                    self.init_ema_model,
                 ]
             )
 
@@ -3500,6 +3499,18 @@ class Trainer:
         fsdp_enabled = getattr(self.config, "fsdp_enable", False)
         is_fsdp2_run = fsdp_enabled and fsdp_version == 2 and self.accelerator.distributed_type == DistributedType.FSDP
 
+        if is_fsdp2_run and getattr(self.config, "ema_device", "cpu") != "accelerator":
+            logger.warning(
+                "FSDP2 EMA shadows are DTensors and must remain on GPU. "
+                "Overriding ema_device to 'accelerator'."
+            )
+            self.config.ema_device = "accelerator"
+        if is_fsdp2_run and getattr(self.config, "ema_cpu_only", False):
+            raise RuntimeError(
+                "ema_cpu_only is not supported with FSDP2. "
+                "FSDP2 EMA shadows are DTensors and must remain on GPU."
+            )
+
         should_log = self.accelerator.is_main_process
         # TwinFlow requires EMA on all ranks for teacher passes; create EMA everywhere when enabled.
         twinflow_requires_full_rank = bool(getattr(self.config, "twinflow_enabled", False))
@@ -3538,6 +3549,29 @@ class Trainer:
         # Pass EMA model reference to the model for TwinFlow teacher access
         self.model.ema_model = self.ema_model
         self.model.post_ema_creation()
+
+        # Move EMA shadows to the correct device/dtype.
+        # Under FSDP2, shadows are already DTensors on the correct device — skip .to().
+        if self.ema_model is not None and not is_fsdp2_run:
+            if self.config.ema_device == "accelerator":
+                logger.info("Moving EMA model weights to accelerator...")
+            self.ema_model.to(
+                (self.accelerator.device if self.config.ema_device == "accelerator" else "cpu"),
+                dtype=self.config.weight_dtype,
+            )
+            if self.config.ema_device == "cpu" and not self.config.ema_cpu_only:
+                logger.info("Pinning EMA model weights to CPU...")
+                try:
+                    self.ema_model.pin_memory()
+                except Exception as e:
+                    self._emit_event(
+                        notification_event(
+                            message=f"Failed to pin EMA to CPU: {e}",
+                            severity="warning",
+                            job_id=self.job_id,
+                        )
+                    )
+                    logger.error(f"Failed to pin EMA model to CPU: {e}")
 
     def init_hooks(self):
         from simpletuner.helpers.training.save_hooks import SaveHookManager
@@ -3669,29 +3703,6 @@ class Trainer:
                 self.sidecar_lr_scheduler = prepared
             elif label == "train_dataloader":
                 self.train_dataloaders = [prepared]
-        if self.config.use_ema and self.ema_model is not None:
-            if self.config.ema_device == "accelerator":
-                logger.info("Moving EMA model weights to accelerator...")
-            print(f"EMA model: {self.ema_model}")
-            self.ema_model.to(
-                (self.accelerator.device if self.config.ema_device == "accelerator" else "cpu"),
-                dtype=self.config.weight_dtype,
-            )
-
-            if self.config.ema_device == "cpu" and not self.config.ema_cpu_only:
-                logger.info("Pinning EMA model weights to CPU...")
-                try:
-                    self.ema_model.pin_memory()
-                except Exception as e:
-                    self._emit_event(
-                        notification_event(
-                            message=f"Failed to pin EMA to CPU: {e}",
-                            severity="warning",
-                            job_id=self.job_id,
-                        )
-                    )
-                    logger.error(f"Failed to pin EMA model to CPU: {e}")
-
         idx_count = 0
         for _, backend in StateTracker.get_data_backends().items():
             if idx_count == 0 or "train_dataloader" not in backend:
@@ -4280,6 +4291,11 @@ class Trainer:
         lr_scheduler = self.init_lr_scheduler()
         self.init_hooks()
         self.init_prepare_models(lr_scheduler=lr_scheduler)
+        # EMA must be initialised AFTER accelerator.prepare() so that parameter
+        # ids (which may change during FSDP wrapping) are final.
+        self.init_ema_model()
+        if self.config.use_ema and self.model_hooks is not None:
+            self.model_hooks.ema_model = self.ema_model
         lr_scheduler = self.init_resume_checkpoint(lr_scheduler=lr_scheduler)
         self.init_post_load_freeze()
 

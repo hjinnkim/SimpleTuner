@@ -7,6 +7,7 @@ import types
 from contextlib import contextmanager
 
 import torch
+import torch.distributed.checkpoint as dcp
 from accelerate.utils import DistributedType
 from diffusers.training_utils import _collate_lora_metadata
 from diffusers.utils import convert_state_dict_to_diffusers, convert_unet_state_dict_to_peft
@@ -108,6 +109,12 @@ class SaveHookManager:
 
         self.ema_model_cls = self.model.get_trained_component().__class__
         self.ema_model_subdir = f"{self.model.MODEL_SUBFOLDER}_ema"
+        fsdp_plugin = getattr(getattr(accelerator, "state", None), "fsdp_plugin", None)
+        self.is_fsdp2 = (
+            getattr(accelerator, "distributed_type", DistributedType.NO) == DistributedType.FSDP
+            and fsdp_plugin is not None
+            and getattr(fsdp_plugin, "fsdp_version", 1) == 2
+        )
         self.training_state_path = "training_state.json"
         if self.accelerator is not None:
             rank = get_rank()
@@ -780,21 +787,31 @@ class SaveHookManager:
             is_main_process = getattr(self.accelerator, "is_main_process", True)
 
         with self._offload_models_during_save(is_main_process):
-            if self.args.use_ema and is_main_process:
-                # we'll save this EMA checkpoint for restoring the state easier.
-                ema_model_path = os.path.join(output_dir, self.ema_model_subdir, "ema_model.pt")
-                logger.info(f"Saving EMA model to {ema_model_path}")
-                try:
-                    self.ema_model.save_state_dict(ema_model_path)
-                except Exception as e:
-                    logger.error(f"Error saving EMA model: {e}")
+            if self.args.use_ema and self.ema_model is not None:
+                if self.is_fsdp2:
+                    ema_ckpt_dir = os.path.join(output_dir, self.ema_model_subdir)
+                    os.makedirs(ema_ckpt_dir, exist_ok=True)
+                    sharded_state = {
+                        f"shadow_params.{i}": p for i, p in enumerate(self.ema_model.shadow_params)
+                    }
+                    try:
+                        dcp.save(sharded_state, checkpoint_id=ema_ckpt_dir)
+                        if is_main_process:
+                            metadata = self.ema_model.state_dict(exclude_params=True)
+                            torch.save(metadata, os.path.join(ema_ckpt_dir, "ema_metadata.pt"))
+                        logger.info(f"EMA model saved via dcp to {ema_ckpt_dir}")
+                    except Exception as e:
+                        logger.error(f"Error saving EMA model via dcp: {e}")
+                elif is_main_process:
+                    ema_model_path = os.path.join(output_dir, self.ema_model_subdir, "ema_model.pt")
+                    logger.info(f"Saving EMA model to {ema_model_path}")
+                    try:
+                        self.ema_model.save_state_dict(ema_model_path)
+                    except Exception as e:
+                        logger.error(f"Error saving EMA model: {e}")
 
             # For Accelerate-managed FSDP v2 checkpoints, rely on Accelerate's native sharded save.
-            if (
-                distributed_type == DistributedType.FSDP
-                and getattr(getattr(self.accelerator, "state", None), "fsdp_plugin", None) is not None
-                and getattr(self.accelerator.state.fsdp_plugin, "fsdp_version", 1) == 2
-            ):
+            if self.is_fsdp2:
                 logger.info("Detected FSDP v2; skipping custom full-model save and relying on Accelerate shards.")
                 # LoRA/LyCORIS adapters are not part of the FSDP-wrapped module; save them explicitly.
                 if is_main_process and "lora" in self.args.model_type:
@@ -895,28 +912,39 @@ class SaveHookManager:
             StateTracker.load_training_state(training_state_path)
         else:
             logger.warning(f"Could not find {training_state_path} in checkpoint dir {input_dir}")
-        if self.args.use_ema and self.accelerator.is_main_process:
-            try:
-                self.model.fuse_qkv_projections()  # if we don't fuse first, we might never load.
-                self.ema_model.load_state_dict(os.path.join(input_dir, self.ema_model_subdir, "ema_model.pt"))
-                # self.ema_model.to(self.accelerator.device)
-            except Exception as e:
-                logger.error(f"Could not load EMA model: {e}")
-        fsdp_plugin = getattr(getattr(self.accelerator, "state", None), "fsdp_plugin", None)
-        is_fsdp2_run = (
-            getattr(self.accelerator, "distributed_type", DistributedType.NO) == DistributedType.FSDP
-            and getattr(fsdp_plugin, "fsdp_version", 1) == 2
-        )
+        if self.args.use_ema and self.ema_model is not None:
+            if self.is_fsdp2:
+                ema_ckpt_dir = os.path.join(input_dir, self.ema_model_subdir)
+                try:
+                    sharded_state = {
+                        f"shadow_params.{i}": p for i, p in enumerate(self.ema_model.shadow_params)
+                    }
+                    dcp.load(sharded_state, checkpoint_id=ema_ckpt_dir)
+                    metadata_path = os.path.join(ema_ckpt_dir, "ema_metadata.pt")
+                    if os.path.exists(metadata_path):
+                        metadata = torch.load(metadata_path, map_location="cpu", weights_only=True)
+                        for key in ("decay", "min_decay", "optimization_step", "update_after_step", "use_ema_warmup", "inv_gamma", "power"):
+                            if key in metadata:
+                                setattr(self.ema_model, key, metadata[key])
+                    logger.info(f"EMA model loaded via dcp from {ema_ckpt_dir}")
+                except Exception as e:
+                    logger.error(f"Could not load EMA model via dcp: {e}")
+            elif self.accelerator.is_main_process:
+                try:
+                    self.model.fuse_qkv_projections()
+                    self.ema_model.load_state_dict(os.path.join(input_dir, self.ema_model_subdir, "ema_model.pt"))
+                except Exception as e:
+                    logger.error(f"Could not load EMA model: {e}")
 
         logger.info(
-            f"load_model_hook: model_type={self.args.model_type!r}, lora_type={self.args.lora_type!r}, is_fsdp2_run={is_fsdp2_run}"
+            f"load_model_hook: model_type={self.args.model_type!r}, lora_type={self.args.lora_type!r}, is_fsdp2={self.is_fsdp2}"
         )
         if "lora" in self.args.model_type and self.args.lora_type == "standard":
             self._load_lora(models=models, input_dir=input_dir)
             self._load_lyrics_embedder_state(input_dir=input_dir)
         elif "lora" in self.args.model_type and self.args.lora_type == "lycoris":
             self._load_lycoris(models=models, input_dir=input_dir)
-        elif not is_fsdp2_run:
+        elif not self.is_fsdp2:
             # Check if this checkpoint looks like a LoRA checkpoint but we're trying to load it as full model
             lora_weights_path = os.path.join(input_dir, "pytorch_lora_weights.safetensors")
             if os.path.exists(lora_weights_path):

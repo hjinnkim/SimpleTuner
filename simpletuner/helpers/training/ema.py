@@ -50,10 +50,7 @@ class EMAModel:
     def _gather_dtensor(tensor: torch.Tensor) -> torch.Tensor:
         if not EMAModel._is_dtensor(tensor):
             return tensor
-        if Replicate is None:
-            raise RuntimeError("DTensor support requires torch.distributed.tensor.Replicate")
-        replicated = tensor.redistribute(tensor.device_mesh, placements=[Replicate()])
-        return replicated.to_local()
+        return tensor.full_tensor()
 
     def __init__(
         self,
@@ -495,9 +492,14 @@ class EMAModel:
         if exclude_params:
             return state_dict
         for idx, param in enumerate(self.shadow_params):
-            value = param if keep_vars else param.detach()
-            if self._is_dtensor(value):
-                value = self._gather_dtensor(value)
+            if self._is_dtensor(param):
+                # For DTensors, gather first (all-gather collective), then detach.
+                # .detach() on a DTensor can fail with device-mismatch errors.
+                value = self._gather_dtensor(param)
+                if not keep_vars:
+                    value = value.detach()
+            else:
+                value = param if keep_vars else param.detach()
             state_dict[f"{prefix}shadow_params.{idx}"] = value
         return state_dict
 

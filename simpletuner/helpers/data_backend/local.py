@@ -138,51 +138,29 @@ class LocalDataBackend(BaseDataBackend):
         if not file_extensions:
             file_extensions = self._default_file_extensions()
 
-        def _rglob_follow_symlinks(path: Path, extensions: List[str]):
-            # Skip Spotlight and Jupyter directories
-            forbidden_directories = {
-                ".Spotlight-V100",
-                ".Trashes",
-                ".fseventsd",
-                ".TemporaryItems",
-                ".zfs",
-                ".ipynb_checkpoints",
-            }
-            if path.name in forbidden_directories:
-                return
+        forbidden_directories = {
+            ".Spotlight-V100",
+            ".Trashes",
+            ".fseventsd",
+            ".TemporaryItems",
+            ".zfs",
+            ".ipynb_checkpoints",
+        }
+        extensions = {f".{ext.lower()}" for ext in file_extensions} if file_extensions else None
 
-            # If no extensions are provided, list all files
-            if not extensions:
-                for p in path.rglob("*"):
-                    if p.is_file():
-                        yield p
-            else:
-                for ext in extensions:
-                    for p in path.rglob(ext):
-                        if p.is_file():
-                            yield p
-
-            for p in path.iterdir():
-                if p.is_dir() and not p.is_symlink():
-                    yield from _rglob_follow_symlinks(p, extensions)
-                elif p.is_symlink():
-                    try:
-                        real_path = p.resolve()
-                        if real_path.is_dir():
-                            yield from _rglob_follow_symlinks(real_path, extensions)
-                    except Exception as e:
-                        logger.warning(f"Broken symlink encountered: {p} - {e}")
-
-        # Prepare the extensions for globbing
-        extensions = [f"*.{ext.lower()}" for ext in file_extensions] if file_extensions else None
-
-        paths = list(_rglob_follow_symlinks(Path(instance_data_dir), extensions))
-
-        # Group files by their parent directory
+        seen_real = set()
         path_dict = {}
-        for path in paths:
-            parent = str(path.parent)
-            path_dict.setdefault(parent, []).append(str(path.absolute()))
+        for dirpath, dirnames, filenames in os.walk(instance_data_dir, followlinks=True):
+            real = os.path.realpath(dirpath)
+            if real in seen_real:
+                dirnames.clear()
+                continue
+            seen_real.add(real)
+            dirnames[:] = [d for d in dirnames if d not in forbidden_directories]
+            for fname in filenames:
+                if extensions is None or os.path.splitext(fname)[1].lower() in extensions:
+                    full_path = os.path.join(dirpath, fname)
+                    path_dict.setdefault(dirpath, []).append(full_path)
 
         results = [(subdir, [], files) for subdir, files in path_dict.items()]
         return results

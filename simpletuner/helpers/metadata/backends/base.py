@@ -811,10 +811,18 @@ class MetadataBackend:
                 raise ValueError(error_msg)
 
         should_shuffle_contents = os.environ.get("SIMPLETUNER_SHUFFLE_BUCKETS", "1") == "1"
-        for bucket, images in self.aspect_ratio_bucket_indices.items():
+        # Use a fixed seed so all ranks produce the same shuffled order.
+        # split_between_processes assumes identical input on every rank;
+        # unsynchronized shuffles cause ~(7/8)^N of samples to be lost.
+        _split_rng = random.Random(StateTracker.get_args().seed)
+        # Sort bucket keys so all ranks iterate in the same order,
+        # even if dict insertion order differs (main process vs JSON reload).
+        _sorted_buckets = sorted(self.aspect_ratio_bucket_indices.keys())
+        for bucket in _sorted_buckets:
+            images = self.aspect_ratio_bucket_indices[bucket]
             if should_shuffle_contents:
                 logger.debug(f"Shuffling bucket {bucket} contents.")
-                shuffle(images)
+                _split_rng.shuffle(images)
             total_img_count_incl_repeats = len(images) * (self.repeats + 1)
             num_batches = ceil(total_img_count_incl_repeats / effective_batch_size)
             trimmed_images = images[: num_batches * effective_batch_size]

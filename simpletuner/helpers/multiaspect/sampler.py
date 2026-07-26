@@ -176,6 +176,12 @@ class MultiAspectSampler(torch.utils.data.Sampler):
         if "seen_images" in previous_state:
             self.logger.info(f"Previous checkpoint had {len(previous_state['seen_images'])} seen {self.sample_type_strs}.")
             self.metadata_backend.seen_images.update(previous_state["seen_images"])
+            if previous_state["seen_images"] and not self._get_unseen_images():
+                self.logger.info(
+                    "Previous checkpoint completed the current sampler epoch; "
+                    f"resetting seen {self.sample_type_strs} before resuming."
+                )
+                self._reset_buckets(raise_exhaustion_signal=False)
 
     def load_buckets(self):
         return list(self.metadata_backend.aspect_ratio_bucket_indices.keys())  # These keys are a float value, eg. 1.78.

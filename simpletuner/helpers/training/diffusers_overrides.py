@@ -841,18 +841,9 @@ def patch_fsdp2_state_dict_loader() -> None:
     if original is None:
         return
 
-    def replacement(
-        accelerator: Accelerator,
-        model: torch.nn.Module,
-        full_sd: dict,
-        cpu_offload: Optional[bool] = None,
-    ):
+    def replacement(accelerator: Accelerator, model: torch.nn.Module, full_sd: dict):
         import torch.distributed as dist
-        from torch.distributed.fsdp import CPUOffloadPolicy
         from torch.distributed.tensor import distribute_tensor
-
-        if cpu_offload is None:
-            cpu_offload = isinstance(accelerator.state.fsdp_plugin.cpu_offload, CPUOffloadPolicy)
 
         meta_state = model.state_dict()
         shards: Dict[str, torch.Tensor] = {}
@@ -882,8 +873,6 @@ def patch_fsdp2_state_dict_loader() -> None:
                     dist.broadcast(shard, src=0, group=dist.group.WORLD)
                     shard = to_contiguous_and_cast(shard, full_param)
 
-                if cpu_offload:
-                    shard = shard.to("cpu")
                 shards[name] = shard
         else:
             for name, sharded_param in meta_state.items():
@@ -897,8 +886,6 @@ def patch_fsdp2_state_dict_loader() -> None:
                     device = accelerator.device if accelerator.device.type != "meta" else torch.device("cpu")
                     shard = torch.empty(sharded_param.size(), device=device, dtype=sharded_param.dtype)
                     dist.broadcast(shard, src=0, group=dist.group.WORLD)
-                if cpu_offload:
-                    shard = shard.to("cpu")
                 shards[name] = shard
 
         model.load_state_dict(shards, assign=True)

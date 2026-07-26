@@ -1,0 +1,117 @@
+# syntax=docker/dockerfile:1
+#
+# Build from the repository root:
+# docker build -f Dockerfile.cuda13.0-torch2.13 \
+#   -t simpletuner:cuda13.0-torch2.13 .
+
+FROM nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04
+
+ARG PYTHON_VERSION=3.12
+ARG PYTORCH_VERSION=2.13.0
+ARG TORCHVISION_VERSION=0.28.0
+ARG TORCHAUDIO_VERSION=2.11.0
+
+ENV CUDA_HOME=/usr/local/cuda-13.0 \
+    DEBIAN_FRONTEND=noninteractive \
+    HF_HOME=/workspace/huggingface \
+    LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:/usr/local/cuda-13.0/targets/x86_64-linux/lib/stubs:${LD_LIBRARY_PATH} \
+    PATH=/opt/venv/bin:$PATH \
+    SIMPLETUNER_WORKSPACE=/workspace/simpletuner \
+    TORCH_CUDA_ARCH_LIST=10.0
+
+WORKDIR /app
+
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        curl \
+        ffmpeg \
+        git \
+        git-lfs \
+        htop \
+        libsm6 \
+        libxext6 \
+        mpi-default-dev \
+        net-tools \
+        ninja-build \
+        openssh-server \
+        python${PYTHON_VERSION} \
+        python${PYTHON_VERSION}-dev \
+        python${PYTHON_VERSION}-venv \
+        rsync \
+        tmux \
+        vim \
+        wget \
+    && rm -rf /var/lib/apt/lists/* \
+    && git lfs install
+
+RUN python${PYTHON_VERSION} -m venv /opt/venv \
+    && pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && pip install --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cu130 \
+        "torch==${PYTORCH_VERSION}+cu130" \
+        "torchaudio==${TORCHAUDIO_VERSION}+cu130" \
+        "torchvision==${TORCHVISION_VERSION}+cu130" \
+    && pip install --no-cache-dir \
+        "accelerate==1.14.0" \
+        "bitsandbytes==0.49.2" \
+        "datasets==5.0.0" \
+        "deepspeed==0.19.2" \
+        "diffusers==0.39.0" \
+        "huggingface_hub[cli,hf_transfer]==1.23.0" \
+        "lm-eval==0.4.12" \
+        "mpi4py==4.1.2" \
+        "ninja==1.13.0" \
+        "nvidia-ml-py==13.610.43" \
+        "peft==0.19.1" \
+        "ramtorch==0.2.3" \
+        "safetensors==0.8.0" \
+        "sentencepiece==0.2.2" \
+        "torchao==0.17.0" \
+        "transformers==5.13.1" \
+        "wandb==0.28.0"
+
+COPY . /app/SimpleTuner
+WORKDIR /app/SimpleTuner
+
+RUN pip install --no-cache-dir -e ".[jxl]" \
+    && pip install --no-build-isolation --no-cache-dir "sageattention==1.0.6"
+
+RUN python - <<'PY'
+import sys
+from importlib.metadata import version
+
+import torch
+
+expected = {
+    "accelerate": "1.14.0",
+    "bitsandbytes": "0.49.2",
+    "deepspeed": "0.19.2",
+    "diffusers": "0.39.0",
+    "torch": "2.13.0+cu130",
+    "torchaudio": "2.11.0+cu130",
+    "torchao": "0.17.0",
+    "torchvision": "0.28.0+cu130",
+    "transformers": "5.13.1",
+}
+
+actual = {package: version(package) for package in expected}
+mismatches = {
+    package: (expected[package], actual[package])
+    for package in expected
+    if actual[package] != expected[package]
+}
+if sys.version_info[:2] != (3, 12):
+    raise SystemExit(f"Expected Python 3.12, found {sys.version.split()[0]}")
+if torch.version.cuda != "13.0":
+    raise SystemExit(f"Expected CUDA 13.0 PyTorch wheels, found {torch.version.cuda}")
+if mismatches:
+    raise SystemExit(f"Unexpected package versions: {mismatches}")
+print(f"Python {sys.version.split()[0]}, torch {torch.__version__}, CUDA {torch.version.cuda}")
+PY
+
+COPY --chmod=755 docker-start.sh /start.sh
+
+VOLUME /workspace
+EXPOSE 22 8001
+ENTRYPOINT ["/start.sh"]

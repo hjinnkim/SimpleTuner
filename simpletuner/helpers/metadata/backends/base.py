@@ -781,6 +781,9 @@ class MetadataBackend:
         # Early validation: check if configuration is mathematically impossible
         buckets_that_will_fail = []
         for bucket, images in self.aspect_ratio_bucket_indices.items():
+            if not images:
+                # Empty buckets are harmless and are handled below without padding.
+                continue
             total_img_count_incl_repeats = len(images) * (self.repeats + 1)
             if total_img_count_incl_repeats < effective_batch_size:
                 buckets_that_will_fail.append(
@@ -866,17 +869,20 @@ class MetadataBackend:
                 raise ValueError(error_msg)
 
         should_shuffle_contents = os.environ.get("SIMPLETUNER_SHUFFLE_BUCKETS", "1") == "1"
+        shuffle_seed = None
         if should_shuffle_contents:
-            # Process-specific RNG seeding must not change the split input across ranks.
-            shuffle_seed = getattr(StateTracker.get_args(), "seed", None)
-            if self.accelerator.is_main_process and shuffle_seed is None:
+            # A single rank-independent seed keeps the split input identical across ranks.
+            args = StateTracker.get_args()
+            shuffle_seed = getattr(args, "seed", None) if args is not None else None
+            is_main_process = getattr(self.accelerator, "is_main_process", True)
+            if is_main_process and shuffle_seed is None:
                 shuffle_seed = random.SystemRandom().getrandbits(64)
-            shuffle_seed = broadcast_object_from_main(shuffle_seed if self.accelerator.is_main_process else None)
+            shuffle_seed = broadcast_object_from_main(shuffle_seed if is_main_process else None)
 
         for bucket, images in self.aspect_ratio_bucket_indices.items():
             if should_shuffle_contents:
                 logger.debug(f"Shuffling bucket {bucket} contents.")
-                images = images.copy()
+                images = list(images)
                 random.Random(f"{shuffle_seed}:{self.id}:{bucket}").shuffle(images)
             total_img_count_incl_repeats = len(images) * (self.repeats + 1)
             num_batches = ceil(total_img_count_incl_repeats / effective_batch_size)
@@ -890,7 +896,7 @@ class MetadataBackend:
                     removed=removed_for_trim,
                     effective_batch_size=effective_batch_size,
                 )
-            if len(trimmed_images) == 0 and should_log():
+            if len(trimmed_images) == 0 and images and should_log():
                 logger.error(
                     f"Bucket {bucket} has no samples after trimming because {len(images)} samples are not enough to satisfy an effective batch size of {effective_batch_size}."
                     " Lower your batch size, increase repeat count, or increase data pool size."
@@ -903,6 +909,16 @@ class MetadataBackend:
                         effective_batch_size=effective_batch_size,
                     )
 
+            # Pad the shuffled global bucket with a cyclic prefix before splitting so every
+            # effective-DP rank receives the same number of samples. This mirrors the
+            # training sampler policy and avoids concentrating all padding on one sample.
+            if apply_padding and trimmed_images and effective_dp_size > 1:
+                padded_size = ceil(len(trimmed_images) / effective_dp_size) * effective_dp_size
+                padding_needed = padded_size - len(trimmed_images)
+                if padding_needed:
+                    cycle_count = ceil(padding_needed / len(trimmed_images))
+                    trimmed_images = trimmed_images + (trimmed_images * cycle_count)[:padding_needed]
+
             # Split data by DP rank (not global rank) when context parallelism is enabled.
             # This ensures all ranks in a CP group get the same data shard.
             if cp_size > 1:
@@ -912,15 +928,11 @@ class MetadataBackend:
                 end_idx = min(start_idx + chunk_size, len(trimmed_images))
                 images_split = trimmed_images[start_idx:end_idx]
 
-                # Match Accelerate's apply_padding behavior by repeating the
-                # final input item, including for otherwise empty DP shards.
-                if apply_padding and trimmed_images and len(images_split) < chunk_size:
-                    images_split = images_split + [trimmed_images[-1]] * (chunk_size - len(images_split))
-
                 new_aspect_ratio_bucket_indices[bucket] = images_split
             else:
-                # Standard splitting when CP is disabled
-                with self.accelerator.split_between_processes(trimmed_images, apply_padding=apply_padding) as images_split:
+                # The bucket is already globally padded when requested; disable
+                # Accelerate's last-item padding so DDP/FSDP2 use the same policy.
+                with self.accelerator.split_between_processes(trimmed_images, apply_padding=False) as images_split:
                     new_aspect_ratio_bucket_indices[bucket] = images_split
 
         self.aspect_ratio_bucket_indices = new_aspect_ratio_bucket_indices
